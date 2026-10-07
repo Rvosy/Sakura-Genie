@@ -1,4 +1,5 @@
 from __future__ import annotations
+from sakura_provider_errors import provider_failure
 
 import json
 import os
@@ -95,6 +96,7 @@ class _Job:
     ) -> None:
         self.request = dict(request)
         self.voice = voice
+        self._context = context
         self._artifacts = artifacts
         self._allocation = artifacts.allocate({"mediaType": "audio/wav", "suffix": ".wav"})
         self.output_path = Path(self._allocation["path"])
@@ -105,6 +107,7 @@ class _Job:
         self._request: _TTSRequest | None = None
         self._state = "running"
         self._error_code = "TTS_SYNTHESIS_FAILED"
+        self._diagnostics = {}
         self._disposer = context.effect(self.close)
 
     @property
@@ -137,6 +140,7 @@ class _Job:
     def fail(self, error_code: object) -> None:
         with self._lock:
             self._error_code = _stable_error_code(error_code)
+            self._diagnostics = provider_failure(self._error_code, error_code)["diagnostics"]
             self._state = "cancelled" if self._cancelled.is_set() else "failed"
             self._done.set()
         self._disposer()
@@ -173,12 +177,13 @@ class _Job:
             if state == "succeeded":
                 try:
                     artifact = self._artifacts.commit(self._allocation["artifactId"])
-                except Exception:
-                    return {"state": "failed", "errorCode": "TTS_ARTIFACT_INVALID"}
+                except Exception as error:
+                    self._context.get("sakura.host.logging").error("语音产物提交失败", fields={"reason_code": "TTS_ARTIFACT_INVALID"})
+                    return {"state": "failed", **provider_failure("TTS_ARTIFACT_INVALID", error)}
                 return {"state": "succeeded", "artifact": artifact}
             if state == "cancelled":
                 return {"state": "cancelled"}
-            return {"state": "failed", "errorCode": error_code}
+            return {"state": "failed", "errorCode": error_code, "diagnostics": self._diagnostics}
         finally:
             self._disposer()
 
@@ -350,7 +355,7 @@ class _Coordinator:
             job.fail("TTS_SYNTHESIS_CANCELLED")
         except Exception as error:
             self._report("tts.synthesis.failed", "error", {"reason_code": _stable_error_code(error), "error_type": type(error).__name__})
-            job.fail(getattr(error, "code", str(error)))
+            job.fail(error)
         finally:
             if source is not None:
                 source.unlink(missing_ok=True)
@@ -767,6 +772,18 @@ class _Coordinator:
         self._thread.join()
 
 
+_CONVERSION_MESSAGES = {
+    "tts.conversion.checking": "正在准备 Genie ONNX 模型",
+    "tts.conversion.reused": "已使用角色包中的 Genie ONNX 模型",
+    "tts.conversion.cache_hit": "已使用 Genie ONNX 转换缓存",
+    "tts.conversion.started": "已启动 Genie ONNX 转换",
+    "tts.conversion.running": "正在转换 Genie ONNX 模型",
+    "tts.conversion.finished": "Genie ONNX 模型转换完成",
+    "tts.conversion.failed": "Genie ONNX 模型转换失败",
+    "tts.conversion.cancelled": "Genie ONNX 模型转换已取消",
+}
+
+
 class GenieProvider:
     def __init__(
         self,
@@ -780,16 +797,25 @@ class GenieProvider:
         self._context = context
         self._character = character
         self._artifacts = artifacts
-        self._diagnostic = diagnostics.emit if diagnostics is not None else None
+        def report(descriptor):
+            event = descriptor["event"]
+            if event in _CONVERSION_MESSAGES:
+                getattr(logger, descriptor["severity"])(_CONVERSION_MESSAGES[event],
+                    fields={"event": event, **descriptor.get("attributes", {})})
+            elif diagnostics is not None:
+                diagnostics.emit(descriptor)
+        self._diagnostic = report if logger is not None else (diagnostics.emit if diagnostics is not None else None)
         self._jobs: dict[str, _Job] = {}
         self._jobs_lock = threading.RLock()
         self._coordinator: _Coordinator | None = None
         self._cache_root = context.data_path("onnx")
         self._log_path = context.data_path("logs/genie.log")
+        self._configuration_diagnostics = {}
         try:
             self._config = _parse_config(context.config.get())
-        except (TypeError, ValueError):
+        except (TypeError, ValueError) as error:
             self._config = None
+            self._configuration_diagnostics = provider_failure("TTS_PROVIDER_UNAVAILABLE", error)["diagnostics"]
 
     def start(self) -> None:
         if self._config is None or not self._config.enabled:
@@ -808,24 +834,27 @@ class GenieProvider:
             "available": self._config is not None
             and self._config.enabled
             and self._coordinator is not None,
+            **({"diagnostics": self._configuration_diagnostics} if self._configuration_diagnostics else {}),
         }
 
     def begin(self, request: Mapping[str, Any]) -> str | dict[str, str]:
         if self._config is None or self._coordinator is None:
-            raise RuntimeError("TTS_PROVIDER_UNAVAILABLE")
+            return {"errorCode": "TTS_PROVIDER_UNAVAILABLE", "diagnostics": self._configuration_diagnostics}
         character_id = request.get("characterId")
         if not isinstance(character_id, str) or not character_id:
             raise ValueError("TTS_REQUEST_INVALID")
         try:
             voice = self._voice(character_id)
         except Exception as error:
-            return {"errorCode": _stable_error_code(error)}
+            self._context.get("sakura.host.logging").error("语音声音配置读取失败", fields={"reason_code": _stable_error_code(error)})
+            return provider_failure(_stable_error_code(error), error)
         job = _Job(self._context, self._artifacts, request, voice)
         try:
             self._coordinator.submit(job)
         except Exception as error:
+            self._context.get("sakura.host.logging").error("语音任务提交失败", fields={"reason_code": _stable_error_code(error)})
             job._disposer()
-            return {"errorCode": _stable_error_code(error)}
+            return provider_failure(_stable_error_code(error), error)
         job_id = f"job_{uuid.uuid4().hex}"
         with self._jobs_lock:
             self._jobs[job_id] = job
@@ -851,6 +880,9 @@ class GenieProvider:
     def warmup(self, character_id: str) -> bool | dict[str, Any]:
         config = self._config
         coordinator = self._coordinator
+        if config is None and self._configuration_diagnostics:
+            return {"accepted": False, "reasonCode": "TTS_PROVIDER_UNAVAILABLE", "stage": "configuration",
+                    "diagnostics": self._configuration_diagnostics}
         if (
             config is None
             or not config.enabled
@@ -869,6 +901,7 @@ class GenieProvider:
                 "reasonCode": _stable_error_code(error),
                 "stage": stage,
                 "errorType": type(error).__name__,
+                "diagnostics": provider_failure(_stable_error_code(error), error)["diagnostics"],
             }
         return True
 
@@ -901,6 +934,7 @@ class GenieProvider:
             coordinator.reconfigure(config)
         changed = self._config != config
         self._config = config
+        self._configuration_diagnostics = {}
         if changed and self._logger is not None:
             self._logger.info("语音提供方配置已更新", fields={"provider": PROVIDER_ID, "enabled": config.enabled})
         return "applied"
@@ -967,7 +1001,7 @@ class GeniePlugin:
                         "type": "select",
                         "default": "managed",
                         "options": [
-                            {"label": "Sakura 内置", "value": "managed"},
+                            {"label": "插件管理的本地服务", "value": "managed"},
                             {"label": "连接已有服务", "value": "custom"},
                         ],
                     },
@@ -1106,6 +1140,7 @@ def _parse_character_voice(
         character, character_id, tone_refs_relative.strip(), "TTS_REFERENCE_UNAVAILABLE"
     )
     references: dict[str, list[ToneReference]] = {}
+    resource_paths = [tone_refs_relative.strip()]
     for raw_line in tone_refs_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -1117,6 +1152,7 @@ def _parse_character_voice(
         audio_path = _required_resource(
             character, character_id, audio_relative, "TTS_REFERENCE_UNAVAILABLE"
         )
+        resource_paths.append(audio_relative)
         references.setdefault(tone, []).append(
             ToneReference(tone, audio_path, text, language.lower())
         )
@@ -1124,8 +1160,9 @@ def _parse_character_voice(
         raise ValueError("TTS_CHARACTER_CONFIG_INVALID")
     onnx_value = extension.get("onnxModelDir", "voice/onnx")
     onnx = _optional_onnx_resource(character, character_id, onnx_value)
+    onnx_ready = onnx is not None and bool(_onnx_files(onnx))
     gpt = sovits = None
-    if onnx is None or not _onnx_files(onnx):
+    if not onnx_ready:
         if not extension.get("gptModel") or not extension.get("sovitsModel"):
             raise ValueError("TTS_ONNX_UNAVAILABLE")
         gpt = _required_resource(
@@ -1134,6 +1171,13 @@ def _parse_character_voice(
         sovits = _required_resource(
             character, character_id, extension["sovitsModel"], "TTS_SOURCE_MODEL_UNAVAILABLE"
         )
+    if onnx_ready:
+        resource_paths.append(onnx_value)
+    resource_paths.extend(extension[key] for key, value in (("gptModel", gpt), ("sovitsModel", sovits)) if value is not None)
+    resource_type = "genie.onnx@1" if onnx_ready else "gpt-sovits.models@1"
+    character.declare_resources(character_id, {"kind": "tts", "paths": resource_paths,
+        "pluginRequirements": [{"kind": "tts", "type": resource_type,
+            "plugins": [{"id": PROVIDER_ID, "name": "Genie"}]}]})
     return _CharacterVoice(
         character_id=character_id,
         remote_character_name="",
