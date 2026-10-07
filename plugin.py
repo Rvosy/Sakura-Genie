@@ -1140,7 +1140,7 @@ def _parse_character_voice(
         character, character_id, tone_refs_relative.strip(), "TTS_REFERENCE_UNAVAILABLE"
     )
     references: dict[str, list[ToneReference]] = {}
-    resource_paths = [tone_refs_relative.strip()]
+    resource_paths = [tone_refs_path]
     for raw_line in tone_refs_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -1152,7 +1152,7 @@ def _parse_character_voice(
         audio_path = _required_resource(
             character, character_id, audio_relative, "TTS_REFERENCE_UNAVAILABLE"
         )
-        resource_paths.append(audio_relative)
+        resource_paths.append(audio_path)
         references.setdefault(tone, []).append(
             ToneReference(tone, audio_path, text, language.lower())
         )
@@ -1172,10 +1172,12 @@ def _parse_character_voice(
             character, character_id, extension["sovitsModel"], "TTS_SOURCE_MODEL_UNAVAILABLE"
         )
     if onnx_ready:
-        resource_paths.append(onnx_value)
-    resource_paths.extend(extension[key] for key, value in (("gptModel", gpt), ("sovitsModel", sovits)) if value is not None)
+        resource_paths.append(onnx)
+    resource_paths.extend(path for path in (gpt, sovits) if path is not None)
+    package_dir = Path(character.resolve_resource(character_id, "character.json")).parent
     resource_type = "genie.onnx@1" if onnx_ready else "gpt-sovits.models@1"
-    character.declare_resources(character_id, {"kind": "tts", "paths": resource_paths,
+    character.declare_resources(character_id, {"kind": "tts",
+        "paths": [path.relative_to(package_dir).as_posix() for path in resource_paths],
         "pluginRequirements": [{"kind": "tts", "type": resource_type,
             "plugins": [{"id": PROVIDER_ID, "name": "Genie"}]}]})
     return _CharacterVoice(
